@@ -945,7 +945,11 @@ def _command_login_inner_once(container_name: str, args) -> None:
         if sess_count == 1:
             if use_namespaces:
                 try:
-                    if run_inner is not None:
+                    # A detached run must use a plain holder and reach the
+                    # command via nsenter; the synchronized foreground holder
+                    # (which execs the command itself) cannot be backgrounded.
+                    _detach_run = getattr(args, "detach", False) and run_inner is not None
+                    if run_inner is not None and not _detach_run:
                         chroot_args = build_chroot_args(
                             rootfs=rootfs,
                             login_uid=login_uid,
