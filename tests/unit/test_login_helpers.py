@@ -1,6 +1,12 @@
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from chroot_distro.commands.login import (
+    _MaxIsolationFallback,
+    _can_fall_back_to_old_isolated,
+    _command_login_inner,
+)
 from chroot_distro.commands.login import _safe_hostname
 from chroot_distro.commands.login.chroot_cmd import build_chroot_args
 from chroot_distro.commands.login.env import resolve_term
@@ -22,6 +28,80 @@ def test_safe_hostname_rejects_overlong_label():
     assert _safe_hostname("a" * 64) == "localhost"
     # each label must be <= 63 even if the whole string is longer
     assert _safe_hostname("ok." + "b" * 64) == "localhost"
+
+
+def test_can_fall_back_only_on_termux_max_isolation_once():
+    """Fallback is allowed only on Termux, only under max isolation, and only
+    until the one-shot opt-out flag is set."""
+    from chroot_distro.commands.login import __init__ as login_mod
+
+    with patch.object(login_mod, "IS_TERMUX", True):
+        # Eligible: Termux + max isolation + not yet retried.
+        assert _can_fall_back_to_old_isolated(True, SimpleNamespace()) is True
+        # Not eligible once the opt-out has been set (prevents a retry loop).
+        assert (
+            _can_fall_back_to_old_isolated(
+                True, SimpleNamespace(_disable_max_isolation=True)
+            )
+            is False
+        )
+        # Not eligible when max isolation is already off.
+        assert _can_fall_back_to_old_isolated(False, SimpleNamespace()) is False
+
+    # Never eligible on a non-Termux (real Linux) host: keep refusing there.
+    with patch.object(login_mod, "IS_TERMUX", False):
+        assert _can_fall_back_to_old_isolated(True, SimpleNamespace()) is False
+
+
+def test_command_login_inner_retries_once_on_fallback():
+    """The wrapper retries the login exactly once with max isolation disabled
+    when the inner run raises _MaxIsolationFallback, then propagates a second
+    failure unchanged."""
+    from chroot_distro.commands.login import __init__ as login_mod
+
+    calls = []
+
+    def fake_once(container_name, args):
+        calls.append(getattr(args, "_disable_max_isolation", False))
+        if len(calls) == 1:
+            raise _MaxIsolationFallback("selinux denied tmpfs /dev")
+        # Second call (fallback) succeeds.
+
+    args = SimpleNamespace()
+    with (
+        patch.object(login_mod, "_command_login_inner_once", side_effect=fake_once),
+        patch.object(login_mod, "warn"),
+    ):
+        _command_login_inner("debian", args)
+
+    assert calls == [False, True]
+    assert args._disable_max_isolation is True
+
+
+def test_command_login_inner_does_not_retry_twice():
+    """A second _MaxIsolationFallback (should not normally happen, since the
+    retry disables max isolation) is not swallowed into an infinite loop."""
+    from chroot_distro.commands.login import __init__ as login_mod
+
+    calls = []
+
+    def always_fallback(container_name, args):
+        calls.append(True)
+        raise _MaxIsolationFallback("still failing")
+
+    with (
+        patch.object(login_mod, "_command_login_inner_once", side_effect=always_fallback),
+        patch.object(login_mod, "warn"),
+    ):
+        try:
+            _command_login_inner("debian", SimpleNamespace())
+            raised = False
+        except _MaxIsolationFallback:
+            raised = True
+
+    # Wrapper only catches the first; the second propagates (no infinite loop).
+    assert raised is True
+    assert len(calls) == 2
 
 
 def test_resolve_term_empty():
@@ -847,6 +927,207 @@ def test_resolve_rootfs_path_symlinks(tmp_path):
     res4 = resolve_rootfs_path(str(rootfs), "/usr/bin/python")
     expected4 = os.path.join(os.path.realpath(str(rootfs)), "usr", "bin", "python3.10")
     assert res4 == expected4
+
+
+def test_get_bindings_max_isolation_binds_nothing():
+    """--isolated (max_isolation) must produce zero host bind mounts so the
+    container has no host path to traverse (e.g. via chroot /proc/1/root)."""
+    from chroot_distro.commands.login.bindings import get_bindings
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("chroot_distro.commands.login.bindings.IS_TERMUX", False),
+    ):
+        binds, rslave = get_bindings(
+            rootfs="/fake/rootfs",
+            minimal=False,
+            isolated=True,
+            max_isolation=True,
+            use_namespaces=True,
+            shared_home=True,
+            shared_tmp=True,
+            shared_display=True,
+            custom_binds=["/host/x:/mnt/x"],
+        )
+        assert binds == []
+        assert rslave == []
+
+
+def test_get_bindings_default_does_not_bind_host_proc():
+    """Default (no-flag) mode must no longer bind-mount the host /proc; a fresh
+    procfs is mounted by get_special_mounts() instead."""
+    from chroot_distro.commands.login.bindings import get_bindings
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("chroot_distro.commands.login.bindings.IS_TERMUX", False),
+    ):
+        binds, _rslave = get_bindings(
+            rootfs="/fake/rootfs",
+            minimal=False,
+            isolated=False,
+            use_namespaces=False,
+        )
+    sources = {src for src, _dst in binds}
+    assert "/proc" not in sources
+    # /dev and /sys are still bound in the default mode.
+    assert "/dev" in sources
+    assert "/sys" in sources
+
+
+def test_special_mounts_default_mode_mounts_fresh_procfs():
+    """Even in the default (non-isolated, no-namespace) mode a fresh procfs is
+    now mounted, with no hidepid hardening (that is max-isolation only)."""
+    from chroot_distro.commands.login.bindings import get_special_mounts
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("chroot_distro.commands.login.bindings.IS_TERMUX", False),
+        patch("chroot_distro.commands.login.bindings._fs_supported", return_value=True),
+    ):
+        specials = get_special_mounts("/fake/rootfs", isolated=False, max_isolation=False)
+
+    proc = [s for s in specials if s.fstype == "proc" and s.target == "/proc"]
+    assert len(proc) == 1
+    assert proc[0].optional is False
+    assert "hidepid" not in proc[0].options
+
+
+def test_special_mounts_max_isolation_fresh_pseudo_fs():
+    """Under max isolation, get_special_mounts must synthesise a fresh /dev
+    tmpfs, a read-only sysfs, a fresh procfs and a fresh /dev/shm."""
+    from chroot_distro.commands.login.bindings import get_special_mounts
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("chroot_distro.commands.login.bindings.IS_TERMUX", False),
+        patch("chroot_distro.commands.login.bindings._fs_supported", return_value=True),
+    ):
+        specials = get_special_mounts("/fake/rootfs", isolated=True, max_isolation=True)
+
+    dev = [s for s in specials if s.fstype == "tmpfs" and s.target == "/dev"]
+    assert len(dev) == 1
+    assert dev[0].optional is False
+
+    sysfs = [s for s in specials if s.fstype == "sysfs" and s.target == "/sys"]
+    assert len(sysfs) == 1
+    assert "ro" in sysfs[0].options
+
+    proc = [s for s in specials if s.fstype == "proc" and s.target == "/proc"]
+    assert len(proc) == 1
+    assert proc[0].optional is False
+
+    shm = [s for s in specials if s.fstype == "tmpfs" and s.target == "/dev/shm"]
+    assert len(shm) == 1
+
+
+def test_filter_flags_by_ns_files_drops_unopenable_cgroup():
+    """A flag whose /proc/<pid>/ns/<name> cannot be opened must be dropped,
+    mirroring Android kernels where nsenter fails to open the cgroup ns."""
+    from chroot_distro.helpers import namespace as ns
+
+    flags = ["--mount", "--uts", "--ipc", "--pid", "--cgroup"]
+
+    def fake_open(path, *a, **k):
+        if path.endswith("/ns/cgroup"):
+            raise OSError(2, "No such file or directory")
+        return 99
+
+    with patch.object(ns.os, "open", side_effect=fake_open), patch.object(ns.os, "close"):
+        kept = ns.filter_flags_by_ns_files(1234, flags)
+    assert "--cgroup" not in kept
+    assert kept == ["--mount", "--uts", "--ipc", "--pid"]
+
+
+def test_filter_flags_by_ns_files_keeps_all_when_openable():
+    from chroot_distro.helpers import namespace as ns
+
+    flags = ["--mount", "--pid", "--cgroup"]
+    with patch.object(ns.os, "open", return_value=7), patch.object(ns.os, "close"):
+        assert ns.filter_flags_by_ns_files(1, flags) == flags
+
+
+def test_holder_run_argv_drops_unopenable_ipc_at_call_time():
+    """run_argv must drop a namespace whose ns file is unopenable right now,
+    but always keep the essential mount namespace."""
+    from chroot_distro.helpers import namespace as ns
+
+    holder = ns.NamespaceHolder(
+        pid=4321,
+        nsenter_flags=["--mount", "--uts", "--ipc", "--pid"],
+        nsenter_exe="/usr/bin/nsenter",
+        container_name="debian",
+    )
+
+    def fake_open(path, *a, **k):
+        if path.endswith("/ns/ipc"):
+            raise OSError(2, "No such file or directory")
+        return 5
+
+    with patch.object(ns.os, "open", side_effect=fake_open), patch.object(ns.os, "close"):
+        argv = holder.run_argv(["true"])
+
+    assert "--ipc" not in argv
+    assert "--mount" in argv
+    assert "--pid" in argv and "--uts" in argv
+    assert argv[:3] == ["/usr/bin/nsenter", "--target", "4321"]
+
+
+def test_holder_run_argv_keeps_mount_even_if_unopenable():
+    from chroot_distro.helpers import namespace as ns
+
+    holder = ns.NamespaceHolder(
+        pid=1,
+        nsenter_flags=["--mount"],
+        nsenter_exe="/usr/bin/nsenter",
+        container_name="x",
+    )
+    with patch.object(ns.os, "open", side_effect=OSError(2, "nope")):
+        argv = holder.run_argv(["true"])
+    assert "--mount" in argv
+
+
+def test_holder_unshare_argv_max_isolation_chroots():
+    """The max-isolation holder must chroot into the rootfs before sleeping so
+    PID 1's root is inside the container (closes chroot /proc/1/root escape)."""
+    from chroot_distro.helpers.namespace import _holder_unshare_argv
+
+    plain = _holder_unshare_argv("/usr/bin/unshare", ["--pid", "--mount"])
+    assert plain[-2:] == ["sleep", "2147483647"]
+    assert "--fork" in plain
+
+    chrooted = _holder_unshare_argv("/usr/bin/unshare", ["--pid", "--mount"], rootfs="/fake/rootfs")
+    assert chrooted[-3] == "python3"
+    assert chrooted[-2] == "-c"
+    launcher = chrooted[-1]
+    assert "os.chroot('/fake/rootfs')" in launcher
+    assert "time.sleep(" in launcher
+    assert "--fork" in chrooted
+
+
+def test_special_mounts_max_isolation_proc_hidepid():
+    """The fresh procfs under max isolation must be hardened with hidepid=2."""
+    from chroot_distro.commands.login.bindings import get_special_mounts
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("chroot_distro.commands.login.bindings.IS_TERMUX", False),
+        patch("chroot_distro.commands.login.bindings._fs_supported", return_value=True),
+    ):
+        specials = get_special_mounts("/fake/rootfs", isolated=True, max_isolation=True)
+    proc = [s for s in specials if s.fstype == "proc"][0]
+    assert "hidepid=2" in proc.options
+
+
+def test_max_isolation_dev_nodes_table():
+    """The minimal device-node table must include the core character devices."""
+    from chroot_distro.commands.login.bindings import MAX_ISOLATION_DEV_NODES
+
+    names = {name for name, _maj, _min, _mode in MAX_ISOLATION_DEV_NODES}
+    assert {"null", "zero", "tty", "random", "urandom", "full"} <= names
+    # null is major 1, minor 3 by Linux convention.
+    null = [n for n in MAX_ISOLATION_DEV_NODES if n[0] == "null"][0]
+    assert null[1] == 1 and null[2] == 3
 
 
 def test_resolve_rootfs_path_loop(tmp_path):

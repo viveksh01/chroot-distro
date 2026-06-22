@@ -137,14 +137,16 @@ def _usb_specials() -> list[SpecialMount]:
     ]
 
 
-def _binfmt_misc_special(*, fresh_proc: bool = False) -> SpecialMount | None:
+def _binfmt_misc_special(*, fresh_proc: bool = True) -> SpecialMount | None:
     """Mount binfmt_misc inside the chroot if the host hasn't already done it.
 
-    On regular Linux with systemd: already mounted → comes in via /proc bind → return None.
-    On Android: the kernel supports it but nothing mounts it → mount it ourselves.
+    The chroot's /proc is now always a fresh procfs (the host /proc is never
+    bind-mounted), so the host's binfmt_misc registrations are never inherited
+    and binfmt_misc must be mounted explicitly when the kernel supports it.
 
-    When *fresh_proc* is True (--isolated), /proc is a new procfs mount in the PID
-    namespace, so binfmt_misc must be mounted explicitly when supported.
+    *fresh_proc* is kept for backward compatibility; when False the old
+    behaviour of skipping the mount if the host already has binfmt_misc is
+    preserved, but callers now pass True since /proc is always fresh.
     """
     # Already mounted? The 'register' file only appears when binfmt_misc is mounted.
     if not fresh_proc and os.path.exists("/proc/sys/fs/binfmt_misc/register"):
@@ -159,7 +161,7 @@ def _binfmt_misc_special(*, fresh_proc: bool = False) -> SpecialMount | None:
         source="binfmt_misc",
         target="/proc/sys/fs/binfmt_misc",
         options="",
-        mkdir=False,  # /proc is already bind-mounted; the dir exists inside
+        mkdir=False,  # the fresh procfs provides the binfmt_misc mountpoint stub
         check="binfmt_misc",
         optional=True,
     )
@@ -217,10 +219,44 @@ def _docker_cgroup_specials() -> list[SpecialMount]:
     return specials
 
 
+def _max_isolation_dev_specials() -> list[SpecialMount]:
+    """Return mounts that synthesise a fresh /dev for maximum isolation.
+
+    Under --isolated the host /dev is never bind-mounted (that would expose
+    host block devices and an escape path). Instead a fresh tmpfs is mounted
+    at /dev and the handful of character devices a normal login needs
+    (null, zero, full, random, urandom, tty) are created inside it. The
+    devpts overmount and /dev/shm tmpfs are added separately below.
+    """
+    return [
+        SpecialMount(
+            fstype="tmpfs",
+            source="tmpfs",
+            target="/dev",
+            options="mode=0755,size=64M",
+            mkdir=True,
+            optional=False,
+        )
+    ]
+
+
+# Minimal character devices created inside the fresh /dev tmpfs under
+# --isolated, as (relative path, major, minor, mode) tuples.
+MAX_ISOLATION_DEV_NODES: tuple[tuple[str, int, int, int], ...] = (
+    ("null", 1, 3, 0o666),
+    ("zero", 1, 5, 0o666),
+    ("full", 1, 7, 0o666),
+    ("random", 1, 8, 0o666),
+    ("urandom", 1, 9, 0o666),
+    ("tty", 5, 0, 0o666),
+)
+
+
 def get_special_mounts(
     rootfs: str,
     *,
     isolated: bool = False,
+    max_isolation: bool = False,
     enable_usb: bool = True,
     enable_binfmt: bool = True,
     enable_docker_cgroup: bool = True,  # enabled by default per user request
@@ -235,20 +271,48 @@ def get_special_mounts(
     own empty, writable /tmp and /run directories. No tmpfs overmount is
     used here because it would mount on top of the display socket and
     /tmp/.X11-unix binds applied earlier, hiding them.
+
+    When *max_isolation* is set (--isolated), the host /dev and /sys are
+    never bind-mounted, so a fresh tmpfs /dev (plus minimal device nodes)
+    and a fresh read-only sysfs are mounted here instead.
     """
     specials: list[SpecialMount] = []
 
-    # PID-namespace-aware procfs (must not bind-mount host /proc when isolated).
-    if isolated:
+    # Maximum isolation synthesises a fresh /dev (host /dev is not bound).
+    if max_isolation:
+        specials.extend(_max_isolation_dev_specials())
+
+    # Fresh procfs. The host /proc is no longer bind-mounted in any mode (see
+    # get_bindings), so a fresh procfs is always mounted here. Under maximum
+    # isolation it is hardened with hidepid=2 (hides other processes'
+    # /proc/<pid> entries and their root/cwd links) plus nosuid/nodev/noexec.
+    # In the default and CD_USE_NS modes it is a plain procfs; note that
+    # without a PID namespace it still reflects the host's global PIDs.
+    proc_options = "hidepid=2,nosuid,nodev,noexec" if max_isolation else ""
+    specials.append(
+        SpecialMount(
+            fstype="proc",
+            source="proc",
+            target="/proc",
+            options=proc_options,
+            mkdir=True,
+            check="proc",
+            optional=False,
+        )
+    )
+
+    # Maximum isolation: a fresh read-only sysfs replaces the host /sys bind
+    # so the guest cannot reach host kernel objects under /sys.
+    if max_isolation:
         specials.append(
             SpecialMount(
-                fstype="proc",
-                source="proc",
-                target="/proc",
-                options="",
+                fstype="sysfs",
+                source="sysfs",
+                target="/sys",
+                options="ro,nosuid,nodev,noexec",
                 mkdir=True,
-                check="proc",
-                optional=False,
+                check="sysfs",
+                optional=True,
             )
         )
 
@@ -281,16 +345,19 @@ def get_special_mounts(
         specials.extend(_usb_specials())
 
     if enable_binfmt:
-        sm = _binfmt_misc_special(fresh_proc=isolated)
+        # /proc is always a fresh procfs now, so binfmt_misc is never inherited
+        # from the host and must be mounted explicitly when supported.
+        sm = _binfmt_misc_special(fresh_proc=True)
         if sm:
             specials.append(sm)
 
     if enable_docker_cgroup and IS_TERMUX:
         specials.extend(_docker_cgroup_specials())
 
-    if enable_shm and not os.path.exists("/dev/shm"):
-        # host already has /dev/shm → comes in via /dev bind
-        # only add a fresh tmpfs when host doesn't have one (some Android kernels)
+    # Under max isolation the host /dev is not bound, so the fresh tmpfs /dev
+    # has no /dev/shm: always mount one. Otherwise only add it when the host
+    # has no /dev/shm to come in via the /dev bind (some Android kernels).
+    if enable_shm and (max_isolation or not os.path.exists("/dev/shm")):
         specials.append(
             SpecialMount(
                 fstype="tmpfs",
@@ -424,6 +491,7 @@ def get_bindings(
     *,
     minimal: bool = False,
     isolated: bool = False,
+    max_isolation: bool = False,
     use_namespaces: bool | None = None,
     shared_home: bool = False,
     shared_tmp: bool = False,
@@ -453,12 +521,27 @@ def get_bindings(
     if use_namespaces is None:
         use_namespaces = isolated
 
+    # Maximum isolation: --isolated binds NOTHING from the host. Even /dev and
+    # /sys are escape vectors (host block devices, /sys kernel objects), and a
+    # bind-mounted host /dev/pts/ptmx can be used to reach host ptys. In this
+    # mode the container relies entirely on fresh pseudo-filesystems mounted by
+    # get_special_mounts() (proc, sysfs ro, a fresh tmpfs /dev with minimal
+    # device nodes, devpts and tmpfs /dev/shm), so there is no host path the
+    # guest can traverse to reach the real root filesystem.
+    if max_isolation:
+        return ([], [])
+
     # 1. Base Linux mounts (always needed for chroot to function correctly)
     # Target paths are absolute guest paths (e.g. /dev) which we will mount nested under rootfs.
     binds.append(("/dev", "/dev"))
-    # Host /proc bind breaks PID namespace isolation; mount procfs in get_special_mounts().
-    if not use_namespaces:
-        binds.append(("/proc", "/proc"))
+    # The host /proc is never bind-mounted any more: even in the default
+    # (no-flag) mode a fresh procfs is mounted by get_special_mounts() so the
+    # container gets its own /proc instance instead of sharing the host mount.
+    # NOTE: without a PID namespace this is NOT a security boundary (the fresh
+    # procfs still shows the same global PIDs, so e.g. `chroot /proc/1/root`
+    # can still reach the host); it only avoids leaking the host /proc mount
+    # into the container's mount table and gives a correct per-chroot
+    # /proc/self. Real process isolation requires CD_USE_NS=1 or --isolated.
     binds.append(("/sys", "/sys"))
 
     # Check if host /dev/pts and /dev/shm exist and mount them. We bind the

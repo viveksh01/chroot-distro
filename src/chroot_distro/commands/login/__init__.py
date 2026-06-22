@@ -422,7 +422,45 @@ def _check_shell_available(rootfs, container_path, login_shell, container_name):
     sys.exit(1)
 
 
+class _MaxIsolationFallback(Exception):
+    """Internal signal: max isolation failed mid-setup and the login should be
+    retried in the old isolated mode (host binds + host /proc, namespaces
+    where supported). Raised on Android where SELinux denies the fresh
+    pseudo-filesystems and kills the chrooted holder."""
+
+
+def _can_fall_back_to_old_isolated(max_isolation: bool, args) -> bool:
+    """Return True if a failed max-isolation setup may degrade to old isolated.
+
+    Only on Android/Termux and only once: the retry sets
+    ``args._disable_max_isolation`` so a second failure is reported normally
+    instead of looping. On a real Linux host we keep refusing, since the user
+    explicitly asked for the strong, escape-proof mode and it should work.
+    """
+    if not (max_isolation and IS_TERMUX):
+        return False
+    return not getattr(args, "_disable_max_isolation", False)
+
+
 def _command_login_inner(container_name: str, args) -> None:
+    """Run the login, degrading max isolation to the old isolated mode once if
+    it cannot be set up on this (Android) kernel."""
+    try:
+        _command_login_inner_once(container_name, args)
+    except _MaxIsolationFallback as exc:
+        warn(
+            "Maximum isolation could not be set up on this Android kernel "
+            f"({exc}). Falling back to the standard isolated mode (host /dev, "
+            "/sys and /proc are bound, with namespaces where the kernel "
+            "supports them). This is the pre-existing --isolated behaviour and "
+            "is NOT fully escape-proof on Android. Use a Linux host whose "
+            "kernel supports namespaces for maximum isolation."
+        )
+        args._disable_max_isolation = True
+        _command_login_inner_once(container_name, args)
+
+
+def _command_login_inner_once(container_name: str, args) -> None:
     rootfs = container_rootfs(container_name)
     if not os.path.isdir(rootfs):
         crit_error(f"container '{container_name}' is not installed.")
@@ -451,9 +489,47 @@ def _command_login_inner(container_name: str, args) -> None:
     # while namespace setup is decided separately by should_use_namespaces().
     skip_extra_mounts = isolated
     use_ns_requested = namespace.should_use_namespaces(isolated)
+    # `--isolated` is the maximum-isolation tier: it binds NOTHING from the
+    # host (not even /dev or /sys), so the container cannot reach the host
+    # filesystem (e.g. via `chroot /proc/1/root`). Any flag that only works by
+    # exposing a host path is therefore inert and must be reported + disabled.
+    #
+    # `_disable_max_isolation` is an internal opt-out set when max isolation
+    # fails mid-setup on Android (SELinux denies the fresh tmpfs /dev and then
+    # kills the chrooted holder, so nsenter can no longer open its ns/mnt).
+    # In that case we re-enter with max isolation off, which keeps the old
+    # `--isolated` behaviour: fewer host mounts plus namespaces where the
+    # kernel supports them, but the host /dev, /sys and /proc are bound again
+    # so the session can actually come up. `--isolated` therefore degrades to
+    # the old isolated mode on Android instead of aborting.
+    max_isolation = isolated and not getattr(args, "_disable_max_isolation", False)
     use_shared_home = getattr(args, "shared_home", False)
     shared_tmp = getattr(args, "shared_tmp", False)
     shared_display = getattr(args, "shared_display", False)
+
+    if max_isolation:
+        disabled = []
+        if use_shared_home:
+            disabled.append("--shared-home")
+        if shared_tmp:
+            disabled.append("--shared-tmp")
+        if shared_display:
+            disabled.append("--shared-display")
+        if getattr(args, "bind", None):
+            disabled.append("--bind")
+        if disabled:
+            warn(
+                "--isolated provides maximum isolation and does not bind any "
+                "host paths into the container; the following "
+                f"flag(s) are ignored: {', '.join(disabled)}. "
+                "Drop --isolated (or use CD_USE_NS=1 for namespace isolation "
+                "that keeps the default mounts) if you need them."
+            )
+        # Force every host-path-sharing option off so nothing is exposed.
+        use_shared_home = False
+        shared_tmp = False
+        shared_display = False
+        args.bind = []
     # Effective hostname is the container name.
     # Sanitised to a valid hostname token by the env builders / UTS setter.
     hostname_arg = container_name
@@ -477,16 +553,18 @@ def _command_login_inner(container_name: str, args) -> None:
     login_cmd = getattr(args, "login_cmd", []) or []
     run_inner = getattr(args, "_run_inner", None)
 
-    # Auto-detect NVIDIA GPU on the host (not relevant for Termux)
+    # Auto-detect NVIDIA GPU on the host (not relevant for Termux). Skipped
+    # under --isolated: GPU integration binds host device nodes and libraries,
+    # which would defeat maximum isolation.
     has_nvidia = False
-    if not IS_TERMUX and not minimal:
+    if not IS_TERMUX and not minimal and not max_isolation:
         has_nvidia = detect_nvidia_gpu()
 
     # AMD/Intel/Mesa GPUs work via the /dev bind, but the container needs the
     # host's Vulkan/EGL/OpenCL ICD descriptors to enumerate the GPU. Bind
     # those config dirs read-only, unless the user already bound the same
     # guest path explicitly.
-    if not IS_TERMUX and not minimal:
+    if not IS_TERMUX and not minimal and not max_isolation:
         existing_guest = {"/" + dst.strip("/") for dst in bind_options_map} | {
             "/" + bindings._split_bind_spec(spec)[1].strip("/") for spec in raw_custom_binds
         }
@@ -777,12 +855,56 @@ def _command_login_inner(container_name: str, args) -> None:
                     f"'xhost +SI:localuser:{login_user}', or a UID-matched user."
                 )
 
+    # Decide the effective namespace state up front so it can gate both the
+    # bind set and the special mounts below. Namespace isolation is
+    # all-or-nothing: probe the full requested set before touching the session
+    # counter or any mount.
+    use_namespaces = use_ns_requested and not minimal
+    if use_namespaces:
+        missing = namespace.probe_namespace_support()
+        if missing:
+            if max_isolation and IS_TERMUX:
+                # Android kernels frequently cannot sustain the namespace
+                # holder (SELinux blocks the fresh tmpfs /dev; the chrooted
+                # holder dies and nsenter then fails to open even ns/mnt).
+                # Degrade to chroot-only maximum isolation: still ZERO host
+                # bind mounts, fresh pseudo-filesystems mounted directly under
+                # the rootfs, but no namespaces. Warn that without a PID
+                # namespace the /proc/<pid>/root escape cannot be closed here.
+                warn(
+                    "Namespace isolation is unavailable on this Android kernel "
+                    f"(missing: {' '.join(missing)}). Using chroot-only maximum "
+                    "isolation: no host paths are bound, but without a PID "
+                    "namespace the container is NOT fully escape-proof on "
+                    "Android (e.g. via /proc/<pid>/root). For full isolation "
+                    "use a Linux host whose kernel supports namespaces."
+                )
+                use_namespaces = False
+            elif max_isolation:
+                # On non-Android hosts, refuse rather than silently downgrade:
+                # the user explicitly asked for the strong, escape-proof mode.
+                crit_error(
+                    "--isolated requires Linux namespace isolation, but this "
+                    f"kernel is missing: {' '.join(missing)}. Isolation needs "
+                    "root with CAP_SYS_ADMIN and kernel support for the "
+                    "mount/PID/UTS/IPC namespaces. Run without --isolated, or "
+                    "use CD_USE_NS=1 on a kernel that supports it."
+                )
+                sys.exit(1)
+            else:
+                warn(
+                    "Namespace isolation unavailable on this kernel "
+                    f"(missing: {' '.join(missing)}). Falling back to non-isolated login."
+                )
+                use_namespaces = False
+
     # 1. Resolve all bind mounts
     resolved_binds, rslave_targets = bindings.get_bindings(
         rootfs=rootfs,
         minimal=minimal,
         isolated=skip_extra_mounts,
-        use_namespaces=use_ns_requested and not minimal,
+        max_isolation=max_isolation and use_namespaces,
+        use_namespaces=use_namespaces,
         shared_home=use_shared_home,
         shared_tmp=shared_tmp,
         shared_display=shared_display,
@@ -802,23 +924,9 @@ def _command_login_inner(container_name: str, args) -> None:
             if key not in user_env_keys_all:
                 child_env[key] = val
 
-    use_namespaces = use_ns_requested and not minimal
     holder = None
     pipe_w = None
     chroot_args = None
-
-    # Namespace isolation is all-or-nothing: probe the full requested set
-    # before touching the session counter or any mount. If any namespace is
-    # unsupported on this kernel, acquire none of them and fall back fully to
-    # host mode, rather than leaving a half-isolated session behind.
-    if use_namespaces:
-        missing = namespace.probe_namespace_support()
-        if missing:
-            warn(
-                "Namespace isolation unavailable on this kernel "
-                f"(missing: {' '.join(missing)}). Falling back to non-isolated login."
-            )
-            use_namespaces = False
 
     try:
         host_mounts_exist = bool(mount_manager.get_active_mounts(rootfs))
@@ -858,7 +966,14 @@ def _command_login_inner(container_name: str, args) -> None:
                         finally:
                             os.close(pipe_r)
                     else:
-                        holder = namespace.acquire_holder(container_name)
+                        # Under maximum isolation the holder chroots into the
+                        # rootfs before sleeping, so PID 1 (and therefore every
+                        # namespace PID reachable via /proc/<pid>/root) has its
+                        # root inside the container and cannot reach the host.
+                        holder = namespace.acquire_holder(
+                            container_name,
+                            rootfs=rootfs if (max_isolation and use_namespaces) else None,
+                        )
                     namespace.write_isolation_mode(container_name, namespace.ISOLATION_MODE_NAMESPACE)
                     if not namespace.make_mount_private(holder):
                         # Many Android kernels already provide an isolated
@@ -874,7 +989,18 @@ def _command_login_inner(container_name: str, args) -> None:
                     if pipe_w is not None:
                         with contextlib.suppress(OSError):
                             os.close(pipe_w)
+                    with contextlib.suppress(Exception):
+                        mount_manager.unmount_all(rootfs, holder=holder)
+                    if holder is not None:
+                        with contextlib.suppress(Exception):
+                            namespace.release_holder(container_name)
+                        namespace.clear_isolation_mode(container_name)
                     session.decrement(container_name, lock_fh=lock_fh)
+                    # The chrooted max-isolation holder can die immediately on
+                    # Android (SELinux). Fall back to the old isolated mode
+                    # instead of failing outright.
+                    if _can_fall_back_to_old_isolated(max_isolation, args):
+                        raise _MaxIsolationFallback(str(exc)) from exc
                     crit_error(str(exc))
                     sys.exit(1)
             else:
@@ -944,13 +1070,42 @@ def _command_login_inner(container_name: str, args) -> None:
                 specials = bindings.get_special_mounts(
                     rootfs,
                     isolated=use_namespaces,
+                    max_isolation=max_isolation and use_namespaces,
                     enable_usb=not minimal,
                     enable_binfmt=not minimal,
                     enable_docker_cgroup=not minimal,
                     enable_shm=not minimal,
                 )
                 for sm in specials:
-                    mount_manager.apply_special_mount(rootfs, sm, holder=holder)
+                    is_maxiso_dev = (
+                        max_isolation and use_namespaces and sm.fstype == "tmpfs" and sm.target == "/dev"
+                    )
+                    if is_maxiso_dev:
+                        # The fresh /dev tmpfs is best-effort under max
+                        # isolation: if the kernel denies it (SELinux on some
+                        # Android kernels rejects mounting tmpfs and emits no
+                        # error), fall back to the container's own empty
+                        # on-disk /dev. That is still not a host bind, so the
+                        # session stays isolated; we just populate the device
+                        # nodes directly on the rootfs /dev directory.
+                        mounted = mount_manager.apply_special_mount(
+                            rootfs, sm, holder=holder, force_optional=True
+                        )
+                        if not mounted:
+                            warn(
+                                "Could not mount a fresh tmpfs /dev; using the "
+                                "container's own /dev directory (still isolated, "
+                                "no host bind)."
+                            )
+                        # Populate the minimal device nodes whether on tmpfs or
+                        # the on-disk dir (the host /dev is never bound).
+                        mount_manager.create_dev_nodes(
+                            rootfs,
+                            bindings.MAX_ISOLATION_DEV_NODES,
+                            holder=holder,
+                        )
+                    else:
+                        mount_manager.apply_special_mount(rootfs, sm, holder=holder)
             except Exception as e:
                 if pipe_w is not None:
                     with contextlib.suppress(OSError):
@@ -960,6 +1115,14 @@ def _command_login_inner(container_name: str, args) -> None:
                     namespace.release_holder(container_name)
                     namespace.clear_isolation_mode(container_name)
                 session.decrement(container_name, lock_fh=lock_fh)
+                # On Android the fresh pseudo-filesystems (tmpfs /dev, proc,
+                # sysfs) are frequently denied by SELinux, which also kills the
+                # chrooted holder so nsenter can no longer open its ns/mnt.
+                # Rather than abort the whole login, degrade once to the old
+                # `--isolated` mode (host binds + host /proc, namespaces where
+                # supported) by re-entering with max isolation disabled.
+                if _can_fall_back_to_old_isolated(max_isolation, args):
+                    raise _MaxIsolationFallback(str(e)) from e
                 crit_error(f"Failed to apply special mounts: {e}")
                 sys.exit(1)
 
@@ -1016,6 +1179,19 @@ def _command_login_inner(container_name: str, args) -> None:
                     crit_error(
                         f"Namespace holder for '{container_name}' is not running. "
                         f"Run '{PROGRAM_NAME} unmount {container_name}' and try again."
+                    )
+                    sys.exit(1)
+                # Under maximum isolation, never reuse a holder that was not
+                # created chrooted (e.g. a stale host-rooted holder left by an
+                # older version or a non-isolated session). Entering it would
+                # re-open the `chroot /proc/1/root` escape.
+                if max_isolation and not namespace.holder_is_max_isolation(container_name):
+                    session.decrement(container_name, lock_fh=lock_fh)
+                    crit_error(
+                        f"Container '{container_name}' already has an active, "
+                        f"non-isolated session/holder. Run "
+                        f"'{PROGRAM_NAME} unmount {container_name}' first, then "
+                        f"log in again with --isolated."
                     )
                     sys.exit(1)
 

@@ -226,6 +226,44 @@ def safe_mount(
         raise MountError(f"Failed to apply mount options '{kernel_options}' to {target}: {stderr}") from e
 
 
+def create_dev_nodes(
+    rootfs: str,
+    nodes,
+    holder: NamespaceHolder | None = None,
+) -> None:
+    """Create minimal character device nodes inside the rootfs ``/dev``.
+
+    *nodes* is an iterable of ``(name, major, minor, mode)`` tuples. Used for
+    the fresh tmpfs ``/dev`` mounted under maximum isolation, where the host
+    ``/dev`` is intentionally not bind-mounted. mknod is run inside the
+    holder's mount namespace (when given) so the nodes land on the new tmpfs;
+    failures are non-fatal and logged at debug level. ``/dev/ptmx``,
+    ``/dev/console`` and the ``std*`` symlinks are provided by the devpts
+    overmount and the login pty wrapper, so they are not created here.
+    """
+    dev_dir = os.path.join(rootfs, "dev")
+    for name, major, minor, mode in nodes:
+        guest_path = f"/dev/{name}"
+        host_path = os.path.join(dev_dir, name)
+        if holder is not None:
+            cmd = ["mknod", "-m", format(mode, "o"), guest_path, "c", str(major), str(minor)]
+            try:
+                result = holder.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    log.debug("mknod %s failed: %s", guest_path, (result.stderr or "").strip())
+            except OSError as exc:
+                log.debug("mknod %s raised: %s", guest_path, exc)
+            continue
+        # No holder (no mount namespace): create directly on the host path.
+        try:
+            if os.path.exists(host_path):
+                continue
+            os.mknod(host_path, mode | 0o020000, os.makedev(major, minor))  # S_IFCHR
+            os.chmod(host_path, mode)
+        except OSError as exc:
+            log.debug("os.mknod %s failed: %s", host_path, exc)
+
+
 def make_rslave(target: str, holder: NamespaceHolder | None = None) -> bool:
     """Set recursive slave mount propagation on *target*.
 
@@ -351,12 +389,17 @@ def _fs_supported(fstype: str) -> bool:
         return False
 
 
-def apply_special_mount(rootfs: str, sm, holder: NamespaceHolder | None = None) -> bool:
+def apply_special_mount(
+    rootfs: str, sm, holder: NamespaceHolder | None = None, force_optional: bool = False
+) -> bool:
     """Execute a single SpecialMount inside rootfs.
 
-    Returns True on success, False on failure (when optional=True).
-    Raises RuntimeError on failure when optional=False.
+    Returns True on success, False on failure (when optional). Raises
+    RuntimeError on failure when not optional. *force_optional* lets the
+    caller treat an otherwise-required mount as best-effort (used for the
+    max-isolation /dev tmpfs, which falls back to the on-disk /dev).
     """
+    optional = sm.optional or force_optional
     if sm.check and not _fs_supported(sm.check):
         log.debug(f"Skipping {sm.fstype} mount: '{sm.check}' not in /proc/filesystems")
         return False
@@ -364,50 +407,90 @@ def apply_special_mount(rootfs: str, sm, holder: NamespaceHolder | None = None) 
     target = os.path.join(rootfs, sm.target.lstrip("/"))
 
     if sm.mkdir:
-        try:
-            os.makedirs(target, exist_ok=True)
-        except OSError as e:
-            msg = f"Failed to create mount target directory {target}: {e}"
-            if sm.optional:
-                log.debug(msg)
-                return False
-            raise RuntimeError(msg) from e
+        # When a holder is present the target may live on a tmpfs that only
+        # exists inside the holder's mount namespace (e.g. the fresh /dev
+        # under maximum isolation). Creating it from the parent process would
+        # write to the underlying directory the namespace cannot see, so the
+        # subsequent mount fails with "mount point does not exist". Create the
+        # directory inside the holder's mount namespace instead.
+        if holder is not None:
+            mk = holder.run(["mkdir", "-p", target], capture_output=True, text=True)
+            if mk.returncode != 0:
+                msg = f"Failed to create mount target directory {target}: {(mk.stderr or '').strip()}"
+                if optional:
+                    log.debug(msg)
+                    return False
+                raise RuntimeError(msg)
+        else:
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError as e:
+                msg = f"Failed to create mount target directory {target}: {e}"
+                if optional:
+                    log.debug(msg)
+                    return False
+                raise RuntimeError(msg) from e
     elif not os.path.exists(target):
-        log.debug(f"Mount target {target} does not exist and mkdir=False, skipping")
-        return False
+        # With a holder, existence must also be checked inside its namespace.
+        if holder is not None:
+            chk = holder.run(["test", "-e", target], capture_output=True, text=True)
+            if chk.returncode != 0:
+                log.debug(f"Mount target {target} does not exist in holder NS and mkdir=False, skipping")
+                return False
+        else:
+            log.debug(f"Mount target {target} does not exist and mkdir=False, skipping")
+            return False
 
     if is_mounted(target, holder=holder):
         return True
 
-    cmd = [_resolve_mount(), "-t", sm.fstype]
+    # Build the list of option strings to try, simplest-last. Android's toybox
+    # `mount` and SELinux frequently reject tmpfs option strings (e.g. size=)
+    # with a non-zero exit and no stderr, so progressively strip options and,
+    # for tmpfs, finally try with none at all.
+    option_attempts: list[str] = []
     if sm.options:
-        cmd += ["-o", sm.options]
-    cmd += [sm.source, target]
+        option_attempts.append(sm.options)
+        # Drop size= (a common toybox/SELinux reject) but keep mode=.
+        reduced = ",".join(o for o in sm.options.split(",") if not o.strip().startswith("size="))
+        if reduced and reduced != sm.options:
+            option_attempts.append(reduced)
+    if sm.fstype == "tmpfs":
+        option_attempts.append("")  # last resort: a bare tmpfs
+    if not option_attempts:
+        option_attempts.append("")
 
-    try:
-        if holder is not None:
-            result = holder.run(cmd, capture_output=True, text=True, timeout=15)
-        else:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-    except subprocess.TimeoutExpired as exc:
-        msg = f"mount timeout for {sm.fstype} at {target}"
-        if sm.optional:
-            log.debug(msg)
-            return False
-        raise RuntimeError(msg) from exc
+    last_err = ""
+    last_code = 0
+    last_cmd: list[str] = []
+    for opts in option_attempts:
+        cmd = [_resolve_mount(), "-t", sm.fstype]
+        if opts:
+            cmd += ["-o", opts]
+        cmd += [sm.source, target]
+        last_cmd = cmd
+        try:
+            if holder is not None:
+                result = holder.run(cmd, capture_output=True, text=True, timeout=15)
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        except subprocess.TimeoutExpired as exc:
+            msg = f"mount timeout for {sm.fstype} at {target}"
+            if optional:
+                log.debug(msg)
+                return False
+            raise RuntimeError(msg) from exc
 
-    if result.returncode != 0:
-        msg = f"mount -t {sm.fstype} failed: {result.stderr.strip()}"
-        if sm.optional:
-            log.debug(msg)
-            return False
-        raise RuntimeError(msg)
+        if result.returncode == 0:
+            log.debug("Mounted %s at %s (options=%r)", sm.fstype, sm.target, opts)
+            return True
+        last_code = result.returncode
+        last_err = ((result.stderr or "").strip() or (result.stdout or "").strip())
+        log.debug("mount -t %s opts=%r failed (rc=%s): %s", sm.fstype, opts, last_code, last_err)
 
-    log.debug(f"Mounted {sm.fstype} at {sm.target}")
-    return True
+    detail = last_err or "(no error output)"
+    msg = f"mount -t {sm.fstype} at {target} failed (exit {last_code}): {detail}; cmd: {' '.join(last_cmd)}"
+    if optional:
+        log.debug(msg)
+        return False
+    raise RuntimeError(msg)

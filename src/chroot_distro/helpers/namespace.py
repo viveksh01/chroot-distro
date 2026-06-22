@@ -25,7 +25,13 @@ _REQUIRED_PROBE_FLAGS = ("--pid", "--mount", "--uts", "--ipc")
 # holder when the kernel supports it (probe_unshare_flags drops unsupported
 # flags), but it is NOT part of the strict pre-check because several Android
 # kernels lack cgroupns and we still want pid/mount/uts/ipc isolation there.
-_OPTIONAL_PROBE_FLAGS = ("--cgroup",)
+#
+# On Termux/Android the cgroup namespace is excluded entirely: several Android
+# kernels accept `unshare --cgroup` and even expose /proc/<pid>/ns/cgroup, yet
+# nsenter still cannot open it (it returns ENOENT for the unopenable ns file),
+# which would abort every isolated session. cgroupns brings little benefit on
+# Android, so we simply never request it there.
+_OPTIONAL_PROBE_FLAGS: tuple[str, ...] = () if IS_TERMUX else ("--cgroup",)
 _PROBE_FLAGS = _REQUIRED_PROBE_FLAGS + _OPTIONAL_PROBE_FLAGS
 _LONG_TO_SHORT = {
     "--mount": "-m",
@@ -94,6 +100,15 @@ def _isolation_mode_file(container_name: str) -> str:
     return os.path.join(_container_data_dir(container_name), "isolation.mode")
 
 
+def _holder_maxiso_file(container_name: str) -> str:
+    return os.path.join(_container_data_dir(container_name), "holder.maxiso")
+
+
+def holder_is_max_isolation(container_name: str) -> bool:
+    """Return True if the live holder was created chrooted (max isolation)."""
+    return os.path.isfile(_holder_maxiso_file(container_name))
+
+
 def _resolve_unshare() -> str:
     if IS_TERMUX:
         termux_unshare = os.path.join(TERMUX_PREFIX, "bin", "unshare")
@@ -136,6 +151,50 @@ def long_flags_to_nsenter(flags: list[str], *, use_long: bool) -> list[str]:
     if use_long:
         return list(flags)
     return [_LONG_TO_SHORT[f] for f in flags if f in _LONG_TO_SHORT]
+
+
+# Maps each unshare long flag to the /proc/<pid>/ns/<name> entry nsenter must
+# open to join that namespace. Some Android kernels accept `unshare --cgroup`
+# yet never expose /proc/<pid>/ns/cgroup, so nsenter fails when it tries to
+# join it. Flags without a matching ns file are dropped before use.
+_FLAG_TO_NS_FILE = {
+    "--mount": "mnt",
+    "--uts": "uts",
+    "--ipc": "ipc",
+    "--pid": "pid",
+    "--cgroup": "cgroup",
+    "--net": "net",
+    "--user": "user",
+}
+
+
+def filter_flags_by_ns_files(pid: int, flags: list[str]) -> list[str]:
+    """Return *flags* keeping only those whose /proc/<pid>/ns/<name> exists.
+
+    Guards against kernels (notably some Android ones) where `unshare`
+    accepts a namespace flag but the process exposes no matching ns file,
+    which would make a later `nsenter` abort with "cannot open
+    /proc/<pid>/ns/<name>". Flags not in the map are kept unchanged.
+    """
+    kept: list[str] = []
+    for flag in flags:
+        ns_name = _FLAG_TO_NS_FILE.get(flag)
+        if ns_name is None:
+            kept.append(flag)
+            continue
+        ns_path = f"/proc/{pid}/ns/{ns_name}"
+        # Use an actual open() rather than os.path.exists(): on Android a ns
+        # file can report as existing yet still be unopenable, and nsenter
+        # would then abort with "cannot open .../ns/<name>". Only keep flags
+        # whose ns file can really be opened (matching what nsenter does).
+        try:
+            fd = os.open(ns_path, os.O_RDONLY)
+        except OSError as exc:
+            log.debug("Dropping namespace flag %s: cannot open %s (%s)", flag, ns_path, exc)
+            continue
+        os.close(fd)
+        kept.append(flag)
+    return kept
 
 
 def probe_unshare_flags() -> list[str]:
@@ -282,7 +341,11 @@ def _read_holder_flags(container_name: str) -> list[str]:
 
 
 def _remove_holder_state(container_name: str) -> None:
-    for path in (_holder_pid_file(container_name), _holder_flags_file(container_name)):
+    for path in (
+        _holder_pid_file(container_name),
+        _holder_flags_file(container_name),
+        _holder_maxiso_file(container_name),
+    ):
         with contextlib.suppress(OSError):
             os.remove(path)
 
@@ -404,6 +467,26 @@ def _pick_new_holder_pid(before: set[int], launcher_pid: int | None = None) -> i
     return min(candidates, key=lambda pid: os.stat(f"/proc/{pid}").st_mtime)
 
 
+# Maps an nsenter argv token (long or short) back to the unshare long flag,
+# so the live-ns filter can be applied to whatever form is in nsenter_flags.
+_NSENTER_TOKEN_TO_LONG = {
+    "--mount": "--mount",
+    "--uts": "--uts",
+    "--ipc": "--ipc",
+    "--pid": "--pid",
+    "--cgroup": "--cgroup",
+    "--net": "--net",
+    "--user": "--user",
+    "-m": "--mount",
+    "-u": "--uts",
+    "-i": "--ipc",
+    "-p": "--pid",
+    "-C": "--cgroup",
+    "-n": "--net",
+    "-U": "--user",
+}
+
+
 @dataclass
 class NamespaceHolder:
     """A long-lived process holding mount/PID/UTS/IPC namespaces."""
@@ -414,8 +497,43 @@ class NamespaceHolder:
     container_name: str
     proc: subprocess.Popen | None = None
 
+    def _live_nsenter_flags(self) -> list[str]:
+        """Return nsenter_flags minus any namespace not openable right now.
+
+        On some Android kernels a /proc/<pid>/ns/<name> entry that was
+        openable when the holder was created later cannot be opened, and
+        nsenter aborts with "cannot open .../ns/<name>". Re-check at call time
+        so nsenter only ever joins namespaces that are currently openable.
+        The mount namespace is essential and is kept even if the probe is
+        inconclusive.
+        """
+        live: list[str] = []
+        for token in self.nsenter_flags:
+            long = _NSENTER_TOKEN_TO_LONG.get(token)
+            if long is None:
+                live.append(token)
+                continue
+            ns_name = _FLAG_TO_NS_FILE.get(long)
+            if ns_name is None:
+                live.append(token)
+                continue
+            ns_path = f"/proc/{self.pid}/ns/{ns_name}"
+            try:
+                fd = os.open(ns_path, os.O_RDONLY)
+            except OSError:
+                if long == "--mount":
+                    # Mount NS is essential; keep it and let nsenter surface
+                    # any real error rather than silently dropping it.
+                    live.append(token)
+                else:
+                    log.debug("nsenter: dropping %s, cannot open %s", token, ns_path)
+                continue
+            os.close(fd)
+            live.append(token)
+        return live
+
     def run_argv(self, cmd: list[str]) -> list[str]:
-        return [self.nsenter_exe, "--target", str(self.pid), *self.nsenter_flags, "--", *cmd]
+        return [self.nsenter_exe, "--target", str(self.pid), *self._live_nsenter_flags(), "--", *cmd]
 
     def run(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
         check = kwargs.pop("check", False)
@@ -441,6 +559,9 @@ def get_live_holder(container_name: str) -> NamespaceHolder | None:
     if pid is None:
         return None
     flags = _read_holder_flags(container_name)
+    # Drop any flag whose ns file the live holder does not expose, so nsenter
+    # never tries to open a missing /proc/<pid>/ns/<name> (Android cgroupns).
+    flags = filter_flags_by_ns_files(pid, flags)
     nsenter = _resolve_nsenter()
     use_long = _nsenter_supports_long_flags(nsenter)
     return NamespaceHolder(
@@ -451,13 +572,32 @@ def get_live_holder(container_name: str) -> NamespaceHolder | None:
     )
 
 
-def _holder_unshare_argv(unshare: str, flags: list[str]) -> list[str]:
-    """Build unshare argv for a detached ``sleep infinity`` namespace holder."""
+def _holder_unshare_argv(unshare: str, flags: list[str], rootfs: str | None = None) -> list[str]:
+    """Build unshare argv for a detached namespace holder.
+
+    Without *rootfs* the holder is a plain ``sleep`` whose root is the host
+    ``/``. Under maximum isolation *rootfs* is given: the holder then runs a
+    tiny Python launcher that ``os.chroot(rootfs)`` before sleeping, so the
+    holder (PID 1 in the namespace) has its root *inside* the container. This
+    closes the ``chroot /proc/1/root`` escape, because every PID's
+    ``/proc/<pid>/root`` then points into the rootfs rather than the host.
+    """
     argv = [unshare]
     if "--pid" in flags and "--fork" not in flags and "-f" not in flags:
         argv.append("--fork")
     argv.extend(flags)
-    argv.extend(["sleep", HOLDER_SLEEP_SECONDS])
+    if rootfs:
+        # chroot into the rootfs, then sleep. The launcher keeps the holder's
+        # root inside the container so no namespace PID can reach the host root.
+        launcher = (
+            "import os, time\n"
+            f"os.chroot({rootfs!r})\n"
+            "os.chdir('/')\n"
+            f"time.sleep({int(HOLDER_SLEEP_SECONDS)})\n"
+        )
+        argv.extend(["python3", "-c", launcher])
+    else:
+        argv.extend(["sleep", HOLDER_SLEEP_SECONDS])
     return argv
 
 
@@ -467,6 +607,7 @@ def _create_holder(
     holder_cmd: list[str] | None = None,
     pipe_r: int | None = None,
     env: dict | None = None,
+    rootfs: str | None = None,
 ) -> NamespaceHolder:
     unshare = _resolve_unshare()
     pid_file = _holder_pid_file(container_name)
@@ -494,7 +635,13 @@ def _create_holder(
         unshare_argv.extend(flags)
         unshare_argv.extend(["python3", "-c", python_script, *holder_cmd])
     else:
-        unshare_argv = _holder_unshare_argv(unshare, flags)
+        unshare_argv = _holder_unshare_argv(unshare, flags, rootfs=rootfs)
+
+    # The chrooted max-isolation holder runs as `python3`, not `sleep`, and is
+    # re-parented below the launched `unshare --fork` just like a custom
+    # holder, so it is detected by its child PID and validated by start-time.
+    self_chroot_holder = bool(rootfs) and not holder_cmd
+    track_as_child = bool(holder_cmd) or self_chroot_holder
 
     popen_kwargs: dict = {
         "start_new_session": True,
@@ -519,17 +666,23 @@ def _create_holder(
         # Up to ~5s: the forked grandchild/child process can take a moment to appear
         # under a busy /proc, especially on Android kernels.
         for _ in range(250):
-            if holder_cmd:
-                assert pipe_r is not None
+            if track_as_child:
                 children = _read_host_child_pids(proc.pid)
                 if children:
                     host_pid = children[0]
                     break
                 # Fallback to scanning all new PIDs (for Android kernels that hide children)
-                for pid in _snapshot_all_pids() - before_pids:
-                    if _is_custom_holder(pid, pipe_r):
-                        host_pid = pid
-                        break
+                if holder_cmd:
+                    assert pipe_r is not None
+                    for pid in _snapshot_all_pids() - before_pids:
+                        if _is_custom_holder(pid, pipe_r):
+                            host_pid = pid
+                            break
+                else:
+                    for pid in _snapshot_all_pids() - before_pids:
+                        if _proc_comm(pid) in ("python3", "python"):
+                            host_pid = pid
+                            break
                 if host_pid is not None:
                     break
             else:
@@ -565,8 +718,18 @@ def _create_holder(
                 )
             raise NamespaceError("Failed to locate namespace holder process on the host.")
 
-        if not holder_cmd and _proc_comm(host_pid) != "sleep":
+        if not track_as_child and _proc_comm(host_pid) != "sleep":
             raise NamespaceError(f"Namespace holder PID {host_pid} is not a sleep process.")
+
+        # Keep only namespaces the holder actually exposes under /proc/<pid>/ns.
+        # Some Android kernels accept `unshare --cgroup` but never create the
+        # cgroup ns file, which would make every later nsenter abort.
+        flags = filter_flags_by_ns_files(host_pid, flags)
+        if "--mount" not in flags:
+            raise NamespaceError(
+                f"Namespace holder PID {host_pid} exposes no mount namespace "
+                "(/proc/<pid>/ns/mnt missing); isolation cannot proceed."
+            )
 
         start_time = _get_process_start_time(host_pid)
         with open(pid_file, "w") as fh:
@@ -574,10 +737,17 @@ def _create_holder(
                 fh.write(f"{host_pid}\n{start_time}\n")
             else:
                 fh.write(f"{host_pid}\n")
-            if holder_cmd:
+            # Custom and self-chrooting holders are validated by start-time
+            # (their comm is python3, not sleep), so mark them as custom.
+            if track_as_child:
                 fh.write("custom\n")
         with open(flags_file, "w") as fh:
             fh.write(" ".join(flags))
+        # Record that this holder is a chrooted max-isolation holder so the
+        # login flow never reuses a stale host-rooted holder under --isolated.
+        if self_chroot_holder:
+            with open(_holder_maxiso_file(container_name), "w") as fh:
+                fh.write("1")
 
         success = True
 
@@ -607,13 +777,21 @@ def acquire_holder(
     holder_cmd: list[str] | None = None,
     pipe_r: int | None = None,
     env: dict | None = None,
+    rootfs: str | None = None,
 ) -> NamespaceHolder:
-    """Reuse or create a namespace holder for the container."""
+    """Reuse or create a namespace holder for the container.
+
+    When *rootfs* is given (maximum isolation, interactive path), the holder
+    chroots into the rootfs before sleeping so PID 1's root is inside the
+    container, closing the ``chroot /proc/1/root`` escape.
+    """
     existing = get_live_holder(container_name)
     if existing is not None:
         return existing
     flags = probe_unshare_flags()
-    return _create_holder(container_name, flags, holder_cmd=holder_cmd, pipe_r=pipe_r, env=env)
+    return _create_holder(
+        container_name, flags, holder_cmd=holder_cmd, pipe_r=pipe_r, env=env, rootfs=rootfs
+    )
 
 
 def release_holder(container_name: str) -> None:
