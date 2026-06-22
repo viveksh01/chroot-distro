@@ -12,6 +12,20 @@ from chroot_distro.commands.list_cmd import (
     _read_image_source,
     _rootfs_size_bytes,
 )
+from chroot_distro.commands.kernel_config import (
+    CONFIG_BUILTIN,
+    CONFIG_MISSING,
+    CONFIG_MODULE,
+    CONFIG_UNKNOWN,
+    KERNEL_FLAG_GROUPS,
+    PROBE_ABSENT,
+    PROBE_PRESENT,
+    PROBE_UNKNOWN,
+    find_kernel_config,
+    lookup_flag,
+    parse_kernel_config,
+    probe_flag_runtime,
+)
 from chroot_distro.constants import (
     BASE_CACHE_DIR,
     CANONICAL_PROGRAM_NAME,
@@ -525,6 +539,92 @@ def _render_capabilities(caps: list[_Capability]) -> None:
         )
 
 
+def _flag_status(flag, parsed: dict | None) -> tuple[str, str, str, bool]:
+    """Resolve one kernel flag to (glyph, color, state_text, counts_as_missing).
+
+    Uses the static kernel config when available; otherwise falls back to a
+    live runtime probe (so Android, where /proc/config.gz is root-only and
+    `info` runs rootless, still gets a meaningful answer). *counts_as_missing*
+    is True only when the option is both required and confirmed absent, so the
+    summary line never flags a merely-unknown option as blocking.
+    """
+    if parsed is not None:
+        status = lookup_flag(parsed, flag.name)
+        if status in (CONFIG_BUILTIN, CONFIG_MODULE):
+            state = "enabled" if status == CONFIG_BUILTIN else "enabled (module)"
+            return _OK, "GREEN", state, False
+        if status == CONFIG_UNKNOWN:
+            return "\u2022", "CYAN", "unknown", False
+        # Confirmed missing in a readable config.
+        if flag.required:
+            return _BAD, "RED", "missing (required)", True
+        return _WARN, "YELLOW", "missing (optional)", False
+
+    # No static config: probe the live kernel.
+    probe = probe_flag_runtime(flag.name)
+    if probe == PROBE_PRESENT:
+        return _OK, "GREEN", "available (runtime)", False
+    if probe == PROBE_ABSENT:
+        if flag.required:
+            return _BAD, "RED", "unavailable (required)", True
+        return _WARN, "YELLOW", "unavailable (optional)", False
+    return "\u2022", "CYAN", "unknown", False
+
+
+def _render_kernel_config() -> None:
+    """Show which CONFIG_* options chroot-distro relies on are enabled.
+
+    Prefers the static kernel build config (``/proc/config.gz`` and friends).
+    When that cannot be read (commonly on Android, where /proc/config.gz is
+    root-only and `info` runs rootless), it falls back to probing the running
+    kernel directly (namespace files, /proc/filesystems, /sys/fs/cgroup) so
+    the report stays useful instead of giving up.
+    """
+    _render_section("KERNEL CONFIG")
+    path, text = find_kernel_config()
+    parsed = parse_kernel_config(text) if text is not None else None
+
+    if parsed is not None:
+        msg(f"  {C['CYAN']}Read from {path}{C['RST']}")
+    else:
+        msg(
+            f"  {C['CYAN']}Kernel config not readable; probing the running "
+            f"kernel instead. For a definitive report run "
+            f"'CONFIG=/path/to/.config {PROGRAM_NAME} info' or as root.{C['RST']}"
+        )
+
+    missing_required: list[str] = []
+    for group in KERNEL_FLAG_GROUPS:
+        msg()
+        msg(f"  {C['WHITE']}{group.title}{C['RST']}")
+        label_w = max(len("CONFIG_" + flag.name) for flag in group.flags) + 1
+        for flag in group.flags:
+            glyph, color, state, counts_missing = _flag_status(flag, parsed)
+            if counts_missing:
+                missing_required.append("CONFIG_" + flag.name)
+            label = "CONFIG_" + flag.name
+            msg(
+                f"    {C[color]}{glyph}{C['RST']} "
+                f"{C['CYAN']}{label + ':':<{label_w}}{C['RST']} "
+                f"{C['WHITE']}{state}{C['RST']} "
+                f"{C['CYAN']}({flag.purpose}){C['RST']}"
+            )
+
+    msg()
+    if missing_required:
+        msg(
+            f"  {C['RED']}{_BAD}{C['RST']} "
+            f"{C['WHITE']}Namespace isolation (--isolated, CD_USE_NS=1) cannot "
+            f"work fully without: {', '.join(missing_required)}.{C['RST']}"
+        )
+    else:
+        msg(
+            f"  {C['GREEN']}{_OK}{C['RST']} "
+            f"{C['WHITE']}All kernel options required for namespace isolation "
+            f"are present.{C['RST']}"
+        )
+
+
 def _running_summary(images: list[_ImageInfo]) -> int:
     """Return the number of containers with live processes or a namespace holder."""
     if not images:
@@ -575,6 +675,7 @@ def command_info(args) -> None:
     _render_basic()
     _render_host(host, host_arch)
     _render_capabilities(capabilities)
+    _render_kernel_config()
     _render_images(images)
     if images:
         msg()
